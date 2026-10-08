@@ -48,6 +48,7 @@ public partial class MainWindow : Window
 
     // ── Nullpunkt Position ───────────────────────────────────────
     private int _nullpunktPosition = 6; // 0-8: Oben-Links bis Unten-Rechts (Standard: Unten-Links)
+    private bool _nullpunktZAufTisch = false; // false: Z0 = Werkstückoberfläche (Standard), true: Z0 = Maschinentisch
 
     // ── Aktives Werkzeug ─────────────────────────────────────────
     private enum CanvasTool { Select, Hand, Zoom, VCarveTextSk, Move, Pfeil, Vermassen, PfadStart, PfadLinie, PfadBogen, PfadSpline, Rechteck, Kreis, NEck, Reihenloch }
@@ -855,8 +856,8 @@ public partial class MainWindow : Window
 
         try
         {
-            var text = _gcodeContent.Replace("\r\n", "\n").Replace("\n", Environment.NewLine);
-            File.WriteAllText(dlg.FileName, text, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+            var text = GetGCodeFuerAusgabe();
+            File.WriteAllText(dlg.FileName, text,new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
         }
         catch (Exception ex)
         {
@@ -880,8 +881,8 @@ public partial class MainWindow : Window
 
         try
         {
-            var text = _gcodeContent.Replace("\r\n", "\n").Replace("\n", Environment.NewLine);
-            File.WriteAllText(filePath, text, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+            var text = GetGCodeFuerAusgabe();
+            File.WriteAllText(filePath, text,new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
         }
         catch (Exception ex)
         {
@@ -920,6 +921,78 @@ public partial class MainWindow : Window
             // Zeichnung aktualisieren
             DrawSkia.InvalidateVisual();
         }
+    }
+
+    private void OnNullpunktZWerkstueck(object sender, RoutedEventArgs e) => SetNullpunktZAufTisch(false);
+    private void OnNullpunktZTisch(object sender, RoutedEventArgs e)      => SetNullpunktZAufTisch(true);
+
+    private void SetNullpunktZAufTisch(bool aufTisch)
+    {
+        _nullpunktZAufTisch = aufTisch;
+        MnuNullpunktZWerkstueck.IsChecked = !aufTisch;
+        MnuNullpunktZTisch.IsChecked      = aufTisch;
+    }
+
+    /// <summary>
+    /// G-Code für Datei/Estlcam. Intern beziehen sich alle Z-Werte auf die Werkstückoberfläche
+    /// (Vorschau und Seitenansicht bleiben so unverändert). Ist der Z-Nullpunkt auf dem
+    /// Maschinentisch, wird beim Ausgeben die Werkstückdicke auf jede absolute Z-Koordinate addiert.
+    /// </summary>
+    private string GetGCodeFuerAusgabe()
+    {
+        var text = _gcodeContent.Replace("\r\n", "\n");
+        if (_nullpunktZAufTisch)
+            text = $"(Nullpunkt Z: Maschinentisch, Werkstückdicke {F4(WorkZ)} addiert)\n"
+                 + AddZOffsetToGCode(text, WorkZ);
+        return text.Replace("\n", Environment.NewLine);
+    }
+
+    private static string F4(double v) => v.ToString("0.0###", System.Globalization.CultureInfo.InvariantCulture);
+
+    private static readonly Regex RxZWord = new(@"(?<![A-Za-z])Z\s*([-+]?(?:\d+\.?\d*|\.\d+))",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    /// <summary>
+    /// Addiert <paramref name="offset"/> auf alle Z-Wörter im absoluten Modus (G90).
+    /// Kommentare in (…) und nach ';' sowie inkrementelle Z-Werte (G91) bleiben unverändert.
+    /// </summary>
+    internal static string AddZOffsetToGCode(string gcode, double offset)
+    {
+        var lines = gcode.Split('\n');
+        bool abs = true;
+        for (int i = 0; i < lines.Length; i++)
+        {
+            var line = lines[i];
+            var sbLine = new StringBuilder(line.Length + 8);
+            int pos = 0;
+            while (pos < line.Length)
+            {
+                // Code-Abschnitt bis zum nächsten Kommentar
+                int open = line.IndexOfAny(['(', ';'], pos);
+                int end  = open < 0 ? line.Length : open;
+                string code = line.Substring(pos, end - pos);
+
+                if (Regex.IsMatch(code, @"\bG0*90\b", RegexOptions.IgnoreCase)) abs = true;
+                if (Regex.IsMatch(code, @"\bG0*91\b", RegexOptions.IgnoreCase)) abs = false;
+
+                if (abs)
+                    code = RxZWord.Replace(code, m =>
+                    {
+                        double z = double.Parse(m.Groups[1].Value, System.Globalization.CultureInfo.InvariantCulture);
+                        return "Z" + (z + offset).ToString("F4", System.Globalization.CultureInfo.InvariantCulture);
+                    });
+                sbLine.Append(code);
+
+                if (open < 0) break;
+                if (line[open] == ';') { sbLine.Append(line, open, line.Length - open); break; }
+                int close = line.IndexOf(')', open);
+                if (close < 0) { sbLine.Append(line, open, line.Length - open); break; }
+                sbLine.Append(line, open, close - open + 1);
+                pos = close + 1;
+            }
+            lines[i] = sbLine.ToString();
+        }
+        return string.Join("\n", lines);
     }
 
     private void UpdateHistoryDetailsForNullpunkt()

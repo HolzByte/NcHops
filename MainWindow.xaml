@@ -283,6 +283,15 @@
                             <TextBlock Style="{StaticResource MI}" Text="⊙" FontSize="13"/>
                         </MenuItem.Icon>
                     </MenuItem>
+                    <MenuItem Header="Nullpunkt Z">
+                        <MenuItem.Icon>
+                            <TextBlock Style="{StaticResource MI}" Text="↕" FontSize="13"/>
+                        </MenuItem.Icon>
+                        <MenuItem Header="Auf Werkstück (Standard)" x:Name="MnuNullpunktZWerkstueck"
+                                  IsCheckable="True" IsChecked="True" Click="OnNullpunktZWerkstueck"/>
+                        <MenuItem Header="Auf Maschinentisch" x:Name="MnuNullpunktZTisch"
+                                  IsCheckable="True" Click="OnNullpunktZTisch"/>
+                    </MenuItem>
                 </MenuItem>
                 <Separator/>
                 <MenuItem Header="Beenden" Click="OnBeenden">
