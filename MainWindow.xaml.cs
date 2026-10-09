@@ -140,7 +140,7 @@ public partial class MainWindow : Window
     // ── Vermassen-Werkzeug ───────────────────────────────────────
     private enum VermKind { Length, ParallelDist, Angle, EdgeDist, EdgeAngle, PointDist, LineToPoint, PointEdgeDist, Coincident, Perpendicular, Parallel, ParallelEdge, PerpendicularEdge, CoincidentCorner,
                             KreisDurchmesser, KreisRadius, KreisKantenDist,
-                            RktSeite, RktKantenDist }
+                            RktSeite, RktKantenDist, RlbSpanne }
     // Kreis-Bemassungen: P2Idx = History-Index des Kreises (P1Idx = -1).
     //   KreisDurchmesser/KreisRadius: Offset = Winkel (rad) der Masslinie ab Kreismitte
     //   KreisKantenDist: Abstand Kreismitte → Werkstückkante (Edge), Offset wie PointEdgeDist
@@ -148,6 +148,10 @@ public partial class MainWindow : Window
     //   Seite 0=unten 1=rechts 2=oben 3=links (siehe GetRektSeiten).
     //   RktSeite: Länge der Seite (Breite bzw. Höhe), Offset = Versatz der Masslinie wie Length
     //   RktKantenDist: Abstand Seite → parallele Werkstückkante (Edge), Offset wie EdgeDist
+    // Lochreihen-Bemassung: RlbSpanne = Abstand erstes → letztes Loch einer Zeile (X) bzw. Spalte (Y),
+    //   P2Idx = kodierter End-Anker (History-Idx + Anker * RlbAnkerOffset),
+    //   Edge = Nummer des Anfangs-Ankers (siehe RlbSpannePaar), Offset wie RktSeite.
+    //   Wird wie eine Rechteck-Bemassung behandelt (IsRktVermKind).
     private enum GeomConstraintMode { None, Coincident, Perpendicular, Parallel }
     private record VermEntry(
         VermKind Kind, int P1Idx, int P2Idx, double Offset, double Value,
@@ -182,6 +186,7 @@ public partial class MainWindow : Window
     private int                _selectedGeomIdx = -1; // gewähltes Geom-Constraint-Symbol (-1 = keines)
     private int _vermPtIdx      = -1;  // erster gewählter Punkt (PointDist / LineToPoint)
     private int _vermKreisIdx   = -1;  // gewählter Kreis (History-Idx) für Kreis-Bemassungen
+    private int _vermRlbAnf     = 0;   // Anfangs-Anker einer RlbSpanne in Arbeit (wird als Edge gespeichert)
     private int _vermHoverKreis = -1;  // gehoverter Kreis (History-Idx)
     private int _vermHoverRkt   = -1;  // gehoverte Rechteck-Seite (History-Idx + Seite * RlbAnkerOffset)
     private int _vermRktIdx     = -1;  // gewählte Rechteck-Seite (History-Idx + Seite * RlbAnkerOffset)
@@ -1641,22 +1646,30 @@ public partial class MainWindow : Window
     private (double x, double y) RlbArrowTipX(ReihenlochbohrungParams p)
     {
         var (sx, sy) = RlbStart(p);
-        return (sx + (p.CountX - 1) * p.SpacingX + RlbArrowLen(p, p.SpacingX), sy);
+        return (sx + p.Laenge(true) + RlbArrowLen(p, p.SpacingX), sy);
     }
 
     private (double x, double y) RlbArrowTipY(ReihenlochbohrungParams p)
     {
         var (sx, sy) = RlbStart(p);
-        return (sx, sy + (p.CountY - 1) * p.SpacingY + RlbArrowLen(p, p.SpacingY));
+        return (sx, sy + p.Laenge(false) + RlbArrowLen(p, p.SpacingY));
     }
 
-    // Anzahl Löcher, die zwischen Start und Pfeilspitze Platz haben (Loch komplett im Werkstück)
-    private static int RlbCountTo(double start, double tip, double spacing, double radius, double work)
+    // Anzahl Löcher, die zwischen Start und Pfeilspitze Platz haben (Loch komplett im Werkstück),
+    // mit den (ggf. einzeln vermassten) Lochabständen der Achse
+    private static int RlbCountToAchse(ReihenlochbohrungParams p, bool inX, double start, double tip,
+                                       double radius, double work)
     {
-        if (spacing <= 0) return 1;
-        int n    = (int)Math.Floor((tip - start) / spacing + 1e-9) + 1;
-        int nMax = (int)Math.Floor((work - radius - start) / spacing + 1e-9) + 1;
-        return Math.Max(1, Math.Min(n, nMax));
+        if (p.Spacing(inX) <= 0) return 1;
+        int n = 1;
+        double off = 0;
+        while (n < 10000)
+        {
+            off += p.Gap(inX, n - 1);
+            if (start + off > tip + 1e-9 || start + off > work - radius + 1e-9) break;
+            n++;
+        }
+        return n;
     }
 
     // 0 = nichts, 1 = Anker, 2 = Pfeil X, 3 = Pfeil Y, 4 = Abstand-Y-Anker (2. Loch in Y),
@@ -1676,7 +1689,7 @@ public partial class MainWindow : Window
         if (RlbAnkerPos(p, 2) is { } aX && Near(aX)) return 5;
         if (RlbAnkerPos(p, 3) is { } aY && Near(aY)) return 6;
         // Pfeilschaft (Strecke letztes Loch → Spitze)
-        double lastX = sx + (p.CountX - 1) * p.SpacingX, lastY = sy + (p.CountY - 1) * p.SpacingY;
+        double lastX = sx + p.Laenge(true), lastY = sy + p.Laenge(false);
         if (Math.Abs(mmY - sy) <= tol / 2 && mmX >= lastX + p.LochD / 2 && mmX <= tx.x) return 2;
         if (Math.Abs(mmX - sx) <= tol / 2 && mmY >= lastY + p.LochD / 2 && mmY <= ty.y) return 3;
         return 0;
@@ -1694,7 +1707,7 @@ public partial class MainWindow : Window
             for (int iy = 0; iy < p.CountY; iy++)
             for (int ix = 0; ix < p.CountX; ix++)
             {
-                double dx = mmX - (sx + ix * p.SpacingX), dy = mmY - (sy + iy * p.SpacingY);
+                double dx = mmX - (sx + p.Off(true, ix)), dy = mmY - (sy + p.Off(false, iy));
                 if (dx * dx + dy * dy <= r * r) return i;
             }
         }
@@ -1775,11 +1788,11 @@ public partial class MainWindow : Window
             }
             case 2:
                 _rlbArrowTip = Math.Max(sx, Math.Min(WorkX, _rlbDragRef.x + dx));
-                _rlbPreview  = p with { CountX = RlbCountTo(sx, _rlbArrowTip, p.SpacingX, r, WorkX) };
+                _rlbPreview  = p with { CountX = RlbCountToAchse(p, true, sx, _rlbArrowTip, r, WorkX) };
                 break;
             case 3:
                 _rlbArrowTip = Math.Max(sy, Math.Min(WorkY, _rlbDragRef.y + dy));
-                _rlbPreview  = p with { CountY = RlbCountTo(sy, _rlbArrowTip, p.SpacingY, r, WorkY) };
+                _rlbPreview  = p with { CountY = RlbCountToAchse(p, false, sy, _rlbArrowTip, r, WorkY) };
                 break;
             case 4:
             {
@@ -1787,29 +1800,29 @@ public partial class MainWindow : Window
                 var orig = _rlbDragOrig ?? p;
                 double y2 = SnapY(_rlbDragRef.y + dy);
                 double spY = Math.Max(p.LochD + 1, Math.Round(y2 - sy, 1));
-                _rlbPreview = p with
+                var np = orig.MitGap(false, 0, spY);
+                _rlbPreview = np with
                 {
-                    SpacingY = spY,
-                    CountY   = RlbCountTo(sy, sy + (orig.CountY - 1) * spY, spY, r, WorkY)
+                    CountY = RlbCountToAchse(np, false, sy, sy + np.Laenge(false), r, WorkY)
                 };
                 break;
             }
             case 5:
             {
                 // Letztes Loch in X verschieben → Anzahl bleibt, Abstand gleichmässig verteilt
-                int n = p.CountX - 1; if (n < 1) break;
+                if (p.CountX < 2) break;
                 double xl = Math.Min(WorkX - r, SnapX(_rlbDragRef.x + dx));
-                double spX = Math.Max(p.LochD + 1, Math.Round((xl - sx) / n, 2));
-                _rlbPreview = p with { SpacingX = spX };
+                var np = p.MitLaenge(true, Math.Round(xl - sx, 2));
+                if (np.MinGap(true) > p.LochD) _rlbPreview = np;
                 break;
             }
             case 6:
             {
                 // Letztes Loch in Y verschieben → Anzahl bleibt, Abstand gleichmässig verteilt
-                int n = p.CountY - 1; if (n < 1) break;
+                if (p.CountY < 2) break;
                 double yl = Math.Min(WorkY - r, SnapY(_rlbDragRef.y + dy));
-                double spY = Math.Max(p.LochD + 1, Math.Round((yl - sy) / n, 2));
-                _rlbPreview = p with { SpacingY = spY };
+                var np = p.MitLaenge(false, Math.Round(yl - sy, 2));
+                if (np.MinGap(false) > p.LochD) _rlbPreview = np;
                 break;
             }
         }
@@ -1890,10 +1903,13 @@ public partial class MainWindow : Window
 
         // Anzahl beibehalten, aber nur so viele Löcher, wie mit dem neuen Abstand ins Werkstück passen
         var (sx, sy) = RlbStart(p);
+        // Geänderter Lochabstand gilt für alle Löcher → Einzelabstände verwerfen
         var np = p with
         {
             SpacingX       = spX,
             SpacingY       = spY,
+            AbstaendeX     = spX == p.SpacingX ? p.AbstaendeX : null,
+            AbstaendeY     = spY == p.SpacingY ? p.AbstaendeY : null,
             Bohrtiefe      = tiefe,
             IstKreistasche = istTasche,
             TascheD        = Math.Round(tascheD, 3),
@@ -1901,8 +1917,8 @@ public partial class MainWindow : Window
         double r = np.LochD / 2;
         np = np with
         {
-            CountX = RlbCountTo(sx, sx + (p.CountX - 1) * spX, spX, r, WorkX),
-            CountY = RlbCountTo(sy, sy + (p.CountY - 1) * spY, spY, r, WorkY),
+            CountX = RlbCountToAchse(np, true,  sx, sx + np.Off(true,  p.CountX - 1), r, WorkX),
+            CountY = RlbCountToAchse(np, false, sy, sy + np.Off(false, p.CountY - 1), r, WorkY),
         };
         if (np == p) return;
 
@@ -1923,8 +1939,8 @@ public partial class MainWindow : Window
         int idx = _history.IndexOf(HistoryList.SelectedItem as HistoryEntry);
         if (idx < 0 || _history[idx].Params is not ReihenlochbohrungParams p) return;
         var (sx, sy) = RlbStart(p);
-        if (inX) sx = (WorkX - (p.CountX - 1) * p.SpacingX) / 2;
-        else     sy = (WorkY - (p.CountY - 1) * p.SpacingY) / 2;
+        if (inX) sx = (WorkX - p.Laenge(true)) / 2;
+        else     sy = (WorkY - p.Laenge(false)) / 2;
         var (nx, ny) = ConvertToNullpunktCoordinates(sx, sy);
         var np = p with { StartX = Math.Round(nx, 3), StartY = Math.Round(ny, 3) };
         if (np != p)
@@ -1949,8 +1965,8 @@ public partial class MainWindow : Window
         _vermPlaced.RemoveAll(en => en.Kind == VermKind.KreisKantenDist && (en.Edge == edgeAnf || en.Edge == edgeEnd)
                                     && DecodeKreisVermIdx(en.P2Idx).histIdx == idx);
         double anf  = inX ? sx : sy;
-        double rest = inX ? WorkX - (sx + (p.CountX - 1) * p.SpacingX)
-                          : WorkY - (sy + (p.CountY - 1) * p.SpacingY);
+        double rest = inX ? WorkX - (sx + p.Laenge(true))
+                          : WorkY - (sy + p.Laenge(false));
         _vermPlaced.Add(new VermEntry(VermKind.KreisKantenDist, -1, idx, 0, Math.Round(anf, 3), Edge: edgeAnf));
         _vermPlaced.Add(new VermEntry(VermKind.KreisKantenDist, -1, idx + ankerEnde * RlbAnkerOffset, 0,
                                       Math.Round(rest, 3), Edge: edgeEnd));
@@ -2007,7 +2023,7 @@ public partial class MainWindow : Window
             for (int iy = 0; iy < op.CountY; iy++)
             for (int ix = 0; ix < op.CountX; ix++)
             {
-                var (cx, cy) = Px(ox + ix * op.SpacingX, oy + iy * op.SpacingY);
+                var (cx, cy) = Px(ox + op.Off(true, ix), oy + op.Off(false, iy));
                 canvas.DrawCircle(cx, cy, (float)(op.LochD / 2), otherPaint);
             }
         }
@@ -2028,7 +2044,7 @@ public partial class MainWindow : Window
         for (int iy = 0; iy < p.CountY; iy++)
         for (int ix = 0; ix < p.CountX; ix++)
         {
-            var (cx, cy) = Px(sx + ix * p.SpacingX, sy + iy * p.SpacingY);
+            var (cx, cy) = Px(sx + p.Off(true, ix), sy + p.Off(false, iy));
             canvas.DrawCircle(cx, cy, rad, holeFill);
             canvas.DrawCircle(cx, cy, rad, holePaint);
         }
@@ -2061,8 +2077,8 @@ public partial class MainWindow : Window
         }
 
         var inv = System.Globalization.CultureInfo.InvariantCulture;
-        double lastX = sx + (p.CountX - 1) * p.SpacingX;
-        double lastY = sy + (p.CountY - 1) * p.SpacingY;
+        double lastX = sx + p.Laenge(true);
+        double lastY = sy + p.Laenge(false);
         double tipX  = _rlbDrag == 2 ? _rlbArrowTip : RlbArrowTipX(p).x;
         double tipY  = _rlbDrag == 3 ? _rlbArrowTip : RlbArrowTipY(p).y;
         DrawArrow((lastX + p.LochD / 2, sy), (Math.Max(tipX, lastX + p.LochD / 2), sy));
@@ -2087,7 +2103,7 @@ public partial class MainWindow : Window
         // Abstand-Y-Anker (2. Loch in Y-Richtung): Raute; beim Ziehen immer sichtbar
         if (p.CountY >= 2 || _rlbDrag == 4)
         {
-            var (ax, ay) = Px(sx, sy + p.SpacingY);
+            var (ax, ay) = Px(sx, sy + p.Gap(false, 0));
             float ds = (float)(6.0 / _zoom);
             using var raute = new SKPath();
             raute.MoveTo(ax, ay - ds); raute.LineTo(ax + ds, ay);
@@ -3015,8 +3031,12 @@ public partial class MainWindow : Window
     // Reihenlochbohrung-Anker werden in der Kreis-Bemassung wie Kreise behandelt.
     // Kodierung: History-Idx + Anker * RlbAnkerOffset
     //   Anker 0 = 1. Loch unten links, 1 = 2. Loch in Y (Lochabstand Y),
-    //   Anker 2 = letztes Loch in X, 3 = letztes Loch in Y
-    private const int RlbAnkerOffset  = 1_000_000;
+    //   Anker 2 = letztes Loch in X, 3 = letztes Loch in Y,
+    //   Anker 4 = letztes Loch oben rechts (nur Lochfeld mit ≥ 2 Löchern in X und Y),
+    //   ab RlbLochCode0 = beliebiges Loch (ix, iy): RlbLochCode0 + ix + iy * RlbLochCodeZeile
+    private const int RlbAnkerOffset   = 10_000;   // max. History-Einträge
+    private const int RlbLochCode0     = 5;
+    private const int RlbLochCodeZeile = 1_000;    // max. Löcher in X
 
     private static (int histIdx, int anker) DecodeKreisVermIdx(int idx)
         => idx < 0 ? (idx, 0) : (idx % RlbAnkerOffset, idx / RlbAnkerOffset);
@@ -3027,18 +3047,31 @@ public partial class MainWindow : Window
         return h >= 0 && h < _history.Count && _history[h].Params is ReihenlochbohrungParams;
     }
 
-    // Mittelpunkt eines Reihenloch-Ankers (Standard-mm), null wenn nicht vorhanden
-    private (double x, double y)? RlbAnkerPos(ReihenlochbohrungParams p, int anker)
+    // Loch-Index (ix, iy) eines Ankers bzw. Loch-Codes, null wenn nicht vorhanden
+    private static (int ix, int iy)? RlbLochIdx(ReihenlochbohrungParams p, int anker)
     {
-        var (sx, sy) = RlbStart(p);
-        return anker switch
+        (int ix, int iy)? li = anker switch
         {
-            0                     => (sx, sy),
-            1 when p.CountY >= 2  => (sx, sy + p.SpacingY),
-            2 when p.CountX >= 2  => (sx + (p.CountX - 1) * p.SpacingX, sy),
-            3 when p.CountY >= 3  => (sx, sy + (p.CountY - 1) * p.SpacingY),  // bei 2 Löchern = Anker 1
+            0                     => (0, 0),
+            1 when p.CountY >= 2  => (0, 1),
+            2 when p.CountX >= 2  => (p.CountX - 1, 0),
+            3 when p.CountY >= 3  => (0, p.CountY - 1),  // bei 2 Löchern = Anker 1
+            4 when p.CountX >= 2 && p.CountY >= 2
+                                  => (p.CountX - 1, p.CountY - 1),
+            >= RlbLochCode0       => ((anker - RlbLochCode0) % RlbLochCodeZeile, (anker - RlbLochCode0) / RlbLochCodeZeile),
             _                     => null
         };
+        return li is { } l && l.ix < p.CountX && l.iy < p.CountY ? l : null;
+    }
+
+    private static int RlbLochCode(int ix, int iy) => RlbLochCode0 + ix + iy * RlbLochCodeZeile;
+
+    // Mittelpunkt eines Reihenloch-Ankers bzw. Lochs (Standard-mm), null wenn nicht vorhanden
+    private (double x, double y)? RlbAnkerPos(ReihenlochbohrungParams p, int anker)
+    {
+        if (RlbLochIdx(p, anker) is not { } l) return null;
+        var (sx, sy) = RlbStart(p);
+        return (sx + p.Off(true, l.ix), sy + p.Off(false, l.iy));
     }
 
     // Mittelpunkt + Radius eines Kreises (History-Idx) in mm, null wenn kein Kreis
@@ -3062,7 +3095,14 @@ public partial class MainWindow : Window
         double tol = 6.0 / _zoom;
         for (int i = _history.Count - 1; i >= 0; i--)
         {
-            foreach (int k in new[] { i + 3 * RlbAnkerOffset, i + 2 * RlbAnkerOffset, i + RlbAnkerOffset, i })
+            // Lochreihe: zuerst die Anker, dann alle übrigen Löcher
+            IEnumerable<int> kandidaten = new[] { i + 4 * RlbAnkerOffset, i + 3 * RlbAnkerOffset, i + 2 * RlbAnkerOffset, i + RlbAnkerOffset, i };
+            if (_history[i].Params is ReihenlochbohrungParams rp && rp.CountX <= RlbLochCodeZeile && rp.CountY <= 200)
+                kandidaten = kandidaten.Concat(
+                    from iy in Enumerable.Range(0, rp.CountY)
+                    from ix in Enumerable.Range(0, rp.CountX)
+                    select i + RlbLochCode(ix, iy) * RlbAnkerOffset);
+            foreach (int k in kandidaten)
             {
                 var g = GetKreisGeom(k); if (g == null) continue;
                 double dx = mmX - g.Value.cx, dy = mmY - g.Value.cy;
@@ -3074,9 +3114,11 @@ public partial class MainWindow : Window
     }
 
     // Kantenabstand eines Reihenloch-Ankers anwenden:
-    //   Anker 0 → Lochreihe verschieben
-    //   Anker 1 / 3 (Y-Richtung): oben/unten → Lochabstand Y, links/rechts → Reihe verschieben
-    //   Anker 2     (X-Richtung): links/rechts → Lochabstand X, oben/unten → Reihe verschieben
+    //   Je Achse der Kante liegt der Anker am Anfang (1. Loch), am Ende (letztes Loch) oder dazwischen:
+    //   Ende   → Lochabstand verteilen, Anfang bleibt (Anker 4 nur, wenn die Anfangsseite bemasst ist,
+    //            sonst Reihe verschieben)
+    //   Anfang → ist die Endseite bereits bemasst: Ende bleibt, Lochabstand verteilen; sonst verschieben
+    //   Anker 1 bei ≥ 3 Löchern in Y (2. Loch): oben/unten → Lochabstand Y
     private void ApplyRlbAnkerVerm(VermEntry en, double newVal)
     {
         var (h, anker) = DecodeKreisVermIdx(en.P2Idx);
@@ -3094,19 +3136,40 @@ public partial class MainWindow : Window
             default: return;
         }
         bool vertikal = en.Edge is 3 or 4;
+        // Achse der Kante: Anfang (1. Loch) / Ende (letztes Loch) und Lage des Ankers darauf
+        int    count = vertikal ? p.CountY : p.CountX;
+        double anf   = vertikal ? sy : sx;
+        double ende  = anf + p.Laenge(!vertikal);
+        double cur   = vertikal ? pos.Value.y : pos.Value.x;
+        double ziel  = vertikal ? ay : ax;
+        bool ankerEnde = count >= 2 && Math.Abs(cur - ende) < 1e-6;
+        bool ankerAnf  = Math.Abs(cur - anf) < 1e-6;
+
+        // Ist ein Anker der Gegenseite (Anfang bzw. Ende) in derselben Achse zu einer Kante bemasst?
+        bool GegenseiteBemasst(bool endeSeite) => RlbSeiteKantenBemasst(h, p, vertikal, endeSeite);
+
+        // Liegt das Loch auf der Grundlinie der Achse (unterste Zeile bzw. linke Spalte, wie Anker 2/3)?
+        var li = RlbLochIdx(p, anker)!.Value;
+        bool grundlinie = vertikal ? li.ix == 0 : li.iy == 0;
+        bool achseX = !vertikal;
+
         ReihenlochbohrungParams np;
-        if (anker is 1 or 3 && vertikal)
+        if (anker == 1 && vertikal && p.CountY >= 3)
         {
-            int n = anker == 1 ? 1 : p.CountY - 1;
-            double spY = Math.Round((ay - sy) / n, 3);
-            if (spY <= p.LochD) return;
-            np = p with { SpacingY = spY };
+            // 2. Loch in Y → Lochabstand Y direkt
+            np = p.MitGap(false, 0, Math.Round(ay - sy, 3));
         }
-        else if (anker == 2 && !vertikal)
+        else if (ankerEnde && (grundlinie || GegenseiteBemasst(endeSeite: false)))
         {
-            double spX = Math.Round((ax - sx) / (p.CountX - 1), 3);
-            if (spX <= p.LochD) return;
-            np = p with { SpacingX = spX };
+            // Letztes Loch: Anfang bleibt, Lochabstand verteilen
+            // (ausserhalb der Grundlinie nur, wenn die Anfangsseite bemasst ist — sonst verschieben)
+            np = p.MitLaenge(achseX, ziel - anf);
+        }
+        else if (ankerAnf && GegenseiteBemasst(endeSeite: true))
+        {
+            // 1. Loch, Endseite bereits bemasst: Ende bleibt, Anfang verschieben, Lochabstand verteilen
+            var (nx, ny) = ConvertToNullpunktCoordinates(vertikal ? sx : ziel, vertikal ? ziel : sy);
+            np = p.MitLaenge(achseX, ende - ziel) with { StartX = Math.Round(nx, 3), StartY = Math.Round(ny, 3) };
         }
         else
         {
@@ -3114,7 +3177,7 @@ public partial class MainWindow : Window
             var (nx, ny) = ConvertToNullpunktCoordinates(sx + (ax - pos.Value.x), sy + (ay - pos.Value.y));
             np = p with { StartX = Math.Round(nx, 3), StartY = Math.Round(ny, 3) };
         }
-        if (np == p) return;
+        if (np == p || np.MinGap(achseX) <= np.LochD) return;
         var old = _history[h];
         bool wasSelected = HistoryList.SelectedItem == old;
         bool wasSuppressed = _suppressHistoryRegen;
@@ -3228,7 +3291,116 @@ public partial class MainWindow : Window
     // ── Rechteck-Bemassung (Seitenlänge / Abstand Seite → Werkstückkante) ──
 
     private static bool IsRktVermKind(VermKind k)
-        => k is VermKind.RktSeite or VermKind.RktKantenDist;
+        => k is VermKind.RktSeite or VermKind.RktKantenDist or VermKind.RlbSpanne;
+
+    // Strecke einer Seiten-/Spannen-Bemassung: Rechteck-Seite bzw. 1. → letztes Loch
+    private ((double x, double y) a, (double x, double y) b)? VermStreckeGeom(VermEntry en)
+        => en.Kind == VermKind.RlbSpanne ? RlbSpanneGeom(en.P2Idx, en.Edge) : GetRktSeiteGeom(en.P2Idx);
+
+    // Anfangs-Anker → End-Anker einer Lochreihe (End-Anker kodiert, Anfangs-Anker als Nummer)
+    private ((double x, double y) a, (double x, double y) b)? RlbSpanneGeom(int endAnkerIdx, int anfAnker)
+    {
+        var (h, anker) = DecodeKreisVermIdx(endAnkerIdx);
+        if (h < 0 || h >= _history.Count || _history[h].Params is not ReihenlochbohrungParams p
+            || RlbSpannePaar(p, anfAnker, anker) == null) return null;
+        var a = RlbAnkerPos(p, anfAnker); var b = RlbAnkerPos(p, anker);
+        return a == null || b == null ? null : (a.Value, b.Value);
+    }
+
+    // Liegen die Löcher a/b (Anker bzw. Loch-Codes) in derselben Zeile (→ X) bzw. Spalte (→ Y)?
+    // → Anfang/Ende (Anfang = kleinerer Index) und Loch-Indizes i < j entlang der Achse
+    private static (int anf, int end, bool inX, int i, int j)? RlbSpannePaar(ReihenlochbohrungParams p, int a, int b)
+    {
+        if (RlbLochIdx(p, a) is not { } la || RlbLochIdx(p, b) is not { } lb || la == lb) return null;
+        if (la.iy == lb.iy)
+            return la.ix < lb.ix ? (a, b, true, la.ix, lb.ix) : (b, a, true, lb.ix, la.ix);
+        if (la.ix == lb.ix)
+            return la.iy < lb.iy ? (a, b, false, la.iy, lb.iy) : (b, a, false, lb.iy, la.iy);
+        return null;
+    }
+
+    // Zwei angeklickte Anker derselben Lochreihe = Anfang und Ende einer Zeile/Spalte?
+    // → (kodierter End-Anker, Anfangs-Anker), sonst null
+    private (int endIdx, int anf)? RlbSpanneIdx(int ankerIdxA, int ankerIdxB)
+    {
+        var (ha, aa) = DecodeKreisVermIdx(ankerIdxA);
+        var (hb, ab) = DecodeKreisVermIdx(ankerIdxB);
+        if (ha != hb || ha < 0 || ha >= _history.Count
+            || _history[ha].Params is not ReihenlochbohrungParams p
+            || RlbSpannePaar(p, aa, ab) is not { } paar) return null;
+        return (ha + paar.end * RlbAnkerOffset, paar.anf);
+    }
+
+    // Ist ein Anker auf der Anfangs- bzw. Endseite der Achse zu einer Werkstückkante bemasst?
+    private bool RlbSeiteKantenBemasst(int h, ReihenlochbohrungParams p, bool vertikal, bool endeSeite)
+    {
+        var (sx, sy) = RlbStart(p);
+        int count = vertikal ? p.CountY : p.CountX;
+        if (count < 2) return false;
+        double anf  = vertikal ? sy : sx;
+        double seite = endeSeite ? anf + p.Laenge(!vertikal) : anf;
+        return _vermPlaced.Any(o =>
+        {
+            if (o.Kind != VermKind.KreisKantenDist || (o.Edge is 3 or 4) != vertikal) return false;
+            var (oh, oa) = DecodeKreisVermIdx(o.P2Idx);
+            if (oh != h || RlbAnkerPos(p, oa) is not { } op) return false;
+            return Math.Abs((vertikal ? op.y : op.x) - seite) < 1e-6;
+        });
+    }
+
+    // Spanne zwischen zwei Löchern einer Zeile/Spalte setzen, Anzahl bleibt:
+    //   1. → letztes Loch: nicht einzeln vermasste Lochabstände gleichmässig verteilen. Fix bleibt die
+    //                      Anfangsseite — ausser nur die Endseite ist zu einer Werkstückkante bemasst.
+    //   sonst:             Abstände zwischen den beiden Löchern einzeln setzen (gilt für alle Zeilen
+    //                      bzw. Spalten), die Löcher dahinter rücken nach, Anfang bleibt.
+    private void ApplyRlbSpanne(VermEntry en, double newVal)
+    {
+        var (h, anker) = DecodeKreisVermIdx(en.P2Idx);
+        if (h < 0 || h >= _history.Count || _history[h].Params is not ReihenlochbohrungParams p
+            || RlbSpannePaar(p, en.Edge, anker) is not { } paar) return;
+        bool inX = paar.inX;
+        ReihenlochbohrungParams np;
+        if (paar.i == 0 && paar.j == p.Count(inX) - 1)
+        {
+            np = p.MitLaenge(inX, newVal);
+            if (RlbSeiteKantenBemasst(h, p, !inX, endeSeite: true) && !RlbSeiteKantenBemasst(h, p, !inX, endeSeite: false))
+            {
+                // Ende bleibt: Anfang um die Längenänderung verschieben
+                var (sx, sy) = RlbStart(p);
+                double d = p.Laenge(inX) - np.Laenge(inX);
+                var (nx, ny) = ConvertToNullpunktCoordinates(inX ? sx + d : sx, inX ? sy : sy + d);
+                np = np with { StartX = Math.Round(nx, 3), StartY = Math.Round(ny, 3) };
+            }
+        }
+        else
+            np = p.MitEinzelabstand(inX, paar.i, paar.j, Math.Round(newVal / (paar.j - paar.i), 3));
+        if (np == p || np.MinGap(inX) <= np.LochD) return;
+        var old = _history[h];
+        bool wasSelected = HistoryList.SelectedItem == old;
+        bool wasSuppressed = _suppressHistoryRegen;
+        _suppressHistoryRegen = true;
+        try { _history[h] = new HistoryEntry(old.Label, RlbDetails(np), np, old.Level); }
+        finally { _suppressHistoryRegen = wasSuppressed; }
+        if (wasSelected) HistoryList.SelectedItem = _history[h];
+    }
+
+    // Lochreihen-Anker gewählt (State 1), Klick auf den Gegen-Anker → Spannen-Vorschau (State 5)
+    private bool StartRlbSpanne(int ankerIdxA, int ankerIdxB)
+    {
+        if (RlbSpanneIdx(ankerIdxA, ankerIdxB) is not { } sp) return false;
+        var g = RlbSpanneGeom(sp.endIdx, sp.anf); if (g == null) return false;
+        _vermP1Abs      = g.Value.a;
+        _vermP2Abs      = g.Value.b;
+        _vermActiveKind = VermKind.RlbSpanne;
+        _vermP1Idx      = -1;
+        _vermP2Idx      = sp.endIdx;
+        _vermRlbAnf     = sp.anf;
+        _vermActiveEdge = 0;
+        _vermOffset     = 0; _vermPtIdx = -1;
+        _vermHoverP1 = -1; _vermHoverP2 = -1; _vermHoverEdge = 0; _vermHoverPoint = -1; _vermHoverKreis = -1; _vermHoverRkt = -1;
+        _vermState      = 5;
+        return true;
+    }
 
     // Kodierte Rechteck-Seite (History-Idx + Seite * RlbAnkerOffset) aus Hover-/Hit-Kodierung
     private static int RktVermIdx(int histIdx, int side) => histIdx + side * RlbAnkerOffset;
@@ -3256,11 +3428,12 @@ public partial class MainWindow : Window
     // Aktueller Ist-Wert einer Rechteck-Bemassung
     private double? RktVermActual(VermEntry en)
     {
-        var g = GetRktSeiteGeom(en.P2Idx); if (g == null) return null;
+        var g = VermStreckeGeom(en); if (g == null) return null;
         var (a, b) = g.Value;
         return en.Kind switch
         {
-            VermKind.RktSeite      => Math.Sqrt((b.x - a.x) * (b.x - a.x) + (b.y - a.y) * (b.y - a.y)),
+            VermKind.RktSeite or VermKind.RlbSpanne
+                                   => Math.Sqrt((b.x - a.x) * (b.x - a.x) + (b.y - a.y) * (b.y - a.y)),
             VermKind.RktKantenDist => EdgeDistValue((a.x + b.x) / 2, (a.y + b.y) / 2, en.Edge),
             _                      => null
         };
@@ -3410,9 +3583,9 @@ public partial class MainWindow : Window
                 return ((g.Value.cx + (en.Edge == 1 ? 0 : WorkX)) / 2, g.Value.cy + en.Offset);
             return (g.Value.cx + en.Offset, (g.Value.cy + (en.Edge == 3 ? 0 : WorkY)) / 2);
         }
-        if (en.Kind == VermKind.RktSeite)
+        if (en.Kind is VermKind.RktSeite or VermKind.RlbSpanne)
         {
-            var g = GetRktSeiteGeom(en.P2Idx); if (g == null) return null;
+            var g = VermStreckeGeom(en); if (g == null) return null;
             var (a, b) = g.Value;
             double dx = b.x - a.x, dy = b.y - a.y;
             double len = Math.Sqrt(dx*dx + dy*dy); if (len < 1e-9) return null;
@@ -3522,9 +3695,9 @@ public partial class MainWindow : Window
                                                      dl.Value.b.x, dl.Value.b.y) <= tol) return i;
                 continue;
             }
-            if (en.Kind == VermKind.RktSeite)
+            if (en.Kind is VermKind.RktSeite or VermKind.RlbSpanne)
             {
-                var rs = GetRktSeiteGeom(en.P2Idx); if (rs == null) continue;
+                var rs = VermStreckeGeom(en); if (rs == null) continue;
                 var (ra, rb) = rs.Value;
                 double rdx = rb.x - ra.x, rdy = rb.y - ra.y;
                 double rl = Math.Sqrt(rdx*rdx + rdy*rdy); if (rl < 1e-9) continue;
@@ -3897,8 +4070,9 @@ public partial class MainWindow : Window
                 return (en.Edge == 1 || en.Edge == 2) ? mmY - g.Value.cy : mmX - g.Value.cx;
             }
             case VermKind.RktSeite:
+            case VermKind.RlbSpanne:
             {
-                var g = GetRktSeiteGeom(en.P2Idx); if (g == null) return en.Offset;
+                var g = VermStreckeGeom(en); if (g == null) return en.Offset;
                 return VermSignedOffset(mmX, mmY, g.Value.a, g.Value.b);
             }
             case VermKind.RktKantenDist:
@@ -4078,6 +4252,13 @@ public partial class MainWindow : Window
     // 3. Klick für Zwei-Segment-Modus: ParallelDist, Angle, EdgeDist, PointDist, LineToPoint positionieren
     private void PlaceTwoSegmentVermAt(double mmX, double mmY)
     {
+        if (_vermActiveKind == VermKind.RlbSpanne)
+        {
+            _vermOffset = VermSignedOffset(mmX, mmY, _vermP1Abs, _vermP2Abs);
+            _vermState  = 2;
+            ShowVermTextBox(Math.Round(VermSegmentLength(), 3), "F3");
+            return;
+        }
         if (_vermActiveKind == VermKind.PointDist)
         {
             double dx = _vermP2Abs.x - _vermP1Abs.x, dy = _vermP2Abs.y - _vermP1Abs.y;
@@ -4345,7 +4526,8 @@ public partial class MainWindow : Window
                     }
                     var newEntry = new VermEntry(_vermActiveKind,
                         _vermP1Idx, _vermP2Idx, _vermOffset, newVal,
-                        _vermQ1Idx, _vermQ2Idx, _vermActiveEdge, eDirX, eDirY);
+                        _vermQ1Idx, _vermQ2Idx,
+                        _vermActiveKind == VermKind.RlbSpanne ? _vermRlbAnf : _vermActiveEdge, eDirX, eDirY);
                     ApplyVermNewEntry(newEntry, newVal);
                     _vermPlaced.Add(newEntry with { Value = newVal });
                     PropagateVermConstraints();
@@ -4431,6 +4613,9 @@ public partial class MainWindow : Window
             case VermKind.RktSeite:
             case VermKind.RktKantenDist:
                 ApplyRktVerm(en, newVal);
+                break;
+            case VermKind.RlbSpanne:
+                ApplyRlbSpanne(en, newVal);
                 break;
         }
     }
@@ -6073,7 +6258,7 @@ public partial class MainWindow : Window
                     if (m != null && en.Edge > 0)
                         DrawEdgeDist(m.Value.x, m.Value.y, en.Edge, drawOffset, lblR);
                 }
-                else if (GetRktSeiteGeom(en.P2Idx) is { } rs)
+                else if (VermStreckeGeom(en) is { } rs)
                     DrawOneLine(rs.a.x, rs.a.y, rs.b.x, rs.b.y, drawOffset, lblR);
                 continue;
             }
@@ -6215,9 +6400,17 @@ public partial class MainWindow : Window
                     Math.Sqrt(rdx*rdx + rdy*rdy).ToString("F2", inv) + " mm");
             }
         }
-        else if (_vermState == 2 && _vermActiveKind == VermKind.RktSeite && _vermRktIdx >= 0)
+        else if (_vermState == 2 && _vermActiveKind == VermKind.RktSeite && _vermRktIdx >= 0
+                 || _vermState == 2 && _vermActiveKind == VermKind.RlbSpanne)
         {
             DrawOneLine(_vermP1Abs.x, _vermP1Abs.y, _vermP2Abs.x, _vermP2Abs.y, _vermOffset, null);
+        }
+        else if (_vermState == 5 && _vermActiveKind == VermKind.RlbSpanne)
+        {
+            // Spanne 1. → letztes Loch: Masslinie folgt der Maus
+            DrawOneLine(_vermP1Abs.x, _vermP1Abs.y, _vermP2Abs.x, _vermP2Abs.y,
+                VermSignedOffset(_vermMouseMm.x, _vermMouseMm.y, _vermP1Abs, _vermP2Abs),
+                VermSegmentLength().ToString("F2", inv) + " mm");
         }
         else if (_vermState == 2 && _vermActiveKind is VermKind.KreisKantenDist or VermKind.RktKantenDist
                  && _vermActiveEdge > 0 && _vermP2Idx >= 0)
@@ -9099,7 +9292,7 @@ private void OnTextfeldTasche (object sender, RoutedEventArgs e) => OpenGraviere
                 {
                     CloseVermTextBox();
                     _vermEditIdx = -1;
-                    if (_vermState == 5 && _vermActiveKind is VermKind.KreisKantenDist or VermKind.RktKantenDist)
+                    if (_vermState == 5 && _vermActiveKind is VermKind.KreisKantenDist or VermKind.RktKantenDist or VermKind.RlbSpanne)
                     { _vermActiveEdge = 0; _vermP2Idx = -1; _vermState = 1; }   // zurück zu „Kreis/Rechteck-Seite gewählt"
                     else if (_vermState == 5) { _vermQ1Idx = -1; _vermQ2Idx = -1; _vermState = 1; }
                     else if (_vermState >= 1) { _vermIsHolding = false; _vermP1Idx = -1; _vermQ1Idx = -1; _vermActiveEdge = 0; _vermKreisIdx = -1; _vermRktIdx = -1; _vermState = 0; if (CanvasGrid.IsMouseCaptured) CanvasGrid.ReleaseMouseCapture(); }
@@ -11651,6 +11844,13 @@ private void OnTextfeldTasche (object sender, RoutedEventArgs e) => OpenGraviere
                 // Kreis gewählt: Klick auf Kante → Kantenabstand, sonst Durchmesser/Radius platzieren
                 if (_vermKreisIdx >= 0 && _vermActiveEdge == 0)
                 {
+                    // Lochreihen-Anker: Klick auf den Gegen-Anker → Spanne 1. → letztes Loch
+                    if (IsRlbAnkerVermIdx(_vermKreisIdx) && HitTestKreisVerm(vmx, vmy) is int ankerB && ankerB >= 0
+                        && StartRlbSpanne(_vermKreisIdx, ankerB))
+                    {
+                        DrawSkia?.InvalidateVisual();
+                        e.Handled = true; return;
+                    }
                     int edgeHitK = HitTestWorkpieceEdge(vmx, vmy);
                     if (edgeHitK > 0) StartKreisKantenDist(_vermKreisIdx, edgeHitK);
                     else              PlaceKreisDimAt(vmx, vmy);
@@ -12265,6 +12465,10 @@ private void OnTextfeldTasche (object sender, RoutedEventArgs e) => OpenGraviere
                     // Kreis/Rechteck-Seite gewählt: nur Werkstückkanten als 2. Auswahl hervorheben
                     _vermHoverPoint = -1; _vermHoverP1 = -1; _vermHoverP2 = -1; _vermHoverKreis = -1; _vermHoverRkt = -1;
                     _vermHoverEdge = HitTestWorkpieceEdge(vmx, vmy);
+                    // Lochreihen-Anker: Gegen-Anker (1. ↔ letztes Loch) als 2. Auswahl hervorheben
+                    if (_vermKreisIdx >= 0 && IsRlbAnkerVermIdx(_vermKreisIdx)
+                        && HitTestKreisVerm(vmx, vmy) is int ab && ab >= 0 && RlbSpanneIdx(_vermKreisIdx, ab) != null)
+                    { _vermHoverKreis = ab; _vermHoverEdge = 0; }
                     // Rechteck-Seite: nur parallele Kanten sind bemassbar
                     if (_vermRktIdx >= 0 && _vermHoverEdge > 0
                         && !RktSeiteParallelZuKante(DecodeKreisVermIdx(_vermRktIdx).anker, _vermHoverEdge))

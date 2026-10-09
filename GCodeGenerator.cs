@@ -120,8 +120,8 @@ public static class GCodeGenerator
         {
             for (int ix = 0; ix < p.CountX; ix++)
             {
-                var x = p.StartX + ix * p.SpacingX;
-                var y = p.StartY + iy * p.SpacingY;
+                var x = p.StartX + p.Off(true, ix);
+                var y = p.StartY + p.Off(false, iy);
                 if (tasche)
                 {
                     sb.Append(Kreistasche(new KreistascheParams(
