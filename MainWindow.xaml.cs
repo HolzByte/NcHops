@@ -8857,10 +8857,7 @@ private void OnTextfeldTasche (object sender, RoutedEventArgs e) => OpenGraviere
                 // Hinweis: Nullpunkt-Verschiebung erfolgt bereits bei der Parameter-Anpassung (AdjustParamsToNullpunkt),
                 // daher keine zusätzliche Verschiebung des GCode nötig
 
-                // Werkzeugwechsel startet die Spindel (M03) neu – läuft bereits eine
-                // Spindel vom vorherigen Werkzeug, muss sie davor gestoppt werden (M05).
-                if (entry.Params is WerkzeugWechselParams && spindleOn && !string.IsNullOrEmpty(code))
-                    code = "M05" + Environment.NewLine + code;
+                // Werkzeugwechsel gibt immer M05 / M06 / M03 aus und startet die Spindel neu
                 if (entry.Params is WerkzeugWechselParams)
                     spindleOn = true;
 

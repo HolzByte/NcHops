@@ -13,9 +13,11 @@ public static class GCodeGenerator
 
     public static string WerkzeugWechsel(WerkzeugWechselParams p)
     {
+        // Klammern im Namen würden den Kommentar vorzeitig beenden
+        string name = p.WerkzeugName.Replace('(', '[').Replace(')', ']');
         var sb = new StringBuilder();
-        sb.AppendLine($"({p.WerkzeugName})");
-        sb.AppendLine($"(D={F(p.Durchmesser)} a={F(p.SchneidenWinkel)})");
+        sb.AppendLine("M05");
+        sb.AppendLine($"M06 ({name})");
         sb.AppendLine($"M03 S{(int)p.Drehzahl}");
         return sb.ToString();
     }
